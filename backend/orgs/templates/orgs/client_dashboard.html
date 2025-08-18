@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OAuth Clients</title>
+</head>
+<body>
+<h1>OAuth Clients for {{ org.name }}</h1>
+{% if rotated_secret %}
+<p><strong>New client secret:</strong> {{ rotated_secret }}</p>
+{% endif %}
+<table border="1">
+    <tr>
+        <th>Name</th>
+        <th>Client ID</th>
+        <th>Actions</th>
+    </tr>
+    {% for client in clients %}
+    <tr>
+        <td>{{ client.name }}</td>
+        <td>{{ client.client_id }}</td>
+        <td>
+            <form method="post">
+                {% csrf_token %}
+                <input type="hidden" name="client_id" value="{{ client.id }}" />
+                <button type="submit">Rotate Secret</button>
+            </form>
+        </td>
+    </tr>
+    {% endfor %}
+</table>
+</body>
+</html>
