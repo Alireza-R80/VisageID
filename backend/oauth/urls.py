@@ -9,4 +9,6 @@ urlpatterns = [
     path("authorize/verify", views.authorize_verify),
     path("token", views.token),
     path("userinfo", views.userinfo),
+    path("revoke", views.revoke),
+    path("introspect", views.introspect),
 ]

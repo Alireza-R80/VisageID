@@ -5,7 +5,7 @@ from django.http import JsonResponse, HttpResponseBadRequest
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
-from .models import AuthSession, AuthorizationCode
+from .models import AuthSession, AuthorizationCode, Token
 from orgs.models import OAuthClient
 from accounts.models import User
 from facekit.adapter import FaceAdapter
@@ -73,22 +73,79 @@ def token(request):
     jwks = json.loads(settings.PUBKEY_JWKS)
     if jwks.get("keys"):
         kid = jwks["keys"][0].get("kid", "dev")
-    id_token = tokens.mint_id_token(str(user.id), aud, nonce, int(auth_code.session.expires_at.timestamp()), kid)
-    access_token = secrets.token_urlsafe(32)
-    return JsonResponse({
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "id_token": id_token,
-        "expires_in": 600,
-    })
+    id_token = tokens.mint_id_token(
+        str(user.id), aud, nonce, int(auth_code.session.expires_at.timestamp()), kid
+    )
+    access_token = tokens.mint_access_token(
+        user, auth_code.session.client, auth_code.session.scope
+    )
+    refresh_token = tokens.mint_refresh_token(
+        user, auth_code.session.client, auth_code.session.scope
+    )
+    return JsonResponse(
+        {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "Bearer",
+            "id_token": id_token,
+            "expires_in": 600,
+        }
+    )
 
 def userinfo(request):
-    if not request.META.get("HTTP_AUTHORIZATION"):
+    auth = request.META.get("HTTP_AUTHORIZATION", "")
+    if not auth.startswith("Bearer "):
         return JsonResponse({"detail": "unauthorized"}, status=401)
-    user = User.objects.first()
-    return JsonResponse({
-        "sub": str(user.id),
-        "name": user.display_name,
-        "email": user.email,
-        "picture": user.avatar_url,
-    })
+    token_str = auth.split()[1]
+    tok = tokens.verify_access_token(token_str)
+    if not tok:
+        return JsonResponse({"detail": "unauthorized"}, status=401)
+    user = tok.user
+    return JsonResponse(
+        {
+            "sub": str(user.id),
+            "name": user.display_name,
+            "email": user.email,
+            "picture": user.avatar_url,
+        }
+    )
+
+
+@csrf_exempt
+def revoke(request):
+    if request.method != "POST":
+        return HttpResponseBadRequest("POST required")
+    data = json.loads(request.body.decode())
+    token_str = data.get("token")
+    try:
+        tok = Token.objects.get(jti=token_str)
+        tok.revoked_at = timezone.now()
+        tok.save()
+    except Token.DoesNotExist:
+        pass
+    return JsonResponse({"revoked": True})
+
+
+@csrf_exempt
+def introspect(request):
+    if request.method != "POST":
+        return HttpResponseBadRequest("POST required")
+    data = json.loads(request.body.decode())
+    token_str = data.get("token")
+    try:
+        tok = Token.objects.get(jti=token_str)
+    except Token.DoesNotExist:
+        return JsonResponse({"active": False})
+    if tok.revoked_at or tok.expires_at <= timezone.now():
+        return JsonResponse({"active": False})
+    return JsonResponse(
+        {
+            "active": True,
+            "scope": tok.scope,
+            "client_id": tok.client.client_id,
+            "token_type": tok.type,
+            "exp": int(tok.expires_at.timestamp()),
+            "iat": int(tok.issued_at.timestamp()),
+            "sub": str(tok.user.id),
+        }
+    )
