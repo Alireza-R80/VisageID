@@ -7,15 +7,19 @@ import secrets
 import numpy as np
 from PIL import Image
 from django.conf import settings
-from django.http import JsonResponse, HttpResponseBadRequest, HttpResponse
+from django.http import JsonResponse, HttpResponseBadRequest, HttpResponse, HttpResponseRedirect
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth import logout as dj_logout
+import os
+import logging
 
 from .models import AuthSession, AuthorizationCode, Token
 from orgs.models import OAuthClient
 from accounts.models import User
 from facekit.adapter import FaceAdapter
 from facekit.liveness import LivenessChecker
+from facekit.detect import FaceDetector
 from . import tokens
 
 adapter = FaceAdapter()
@@ -70,35 +74,93 @@ def authorize(request):
 def authorize_verify(request):
     if request.method != "POST":
         return HttpResponseBadRequest("POST required")
-    data = json.loads(request.body.decode())
+    content_type = request.META.get("CONTENT_TYPE", "")
+    if content_type.startswith("application/json"):
+        try:
+            data = json.loads(request.body.decode() or "{}")
+        except Exception:
+            data = {}
+    else:
+        data = request.POST.dict()
     client_id = data.get("client_id")
     state = data.get("state")
     redirect_uri = data.get("redirect_uri")
     image_b64 = data.get("image")
     if not image_b64:
+        if os.getenv("FACE_DEBUG", "").lower() == "true":
+            logging.warning("authorize_verify missing payload: ct=%s, has_image=%s", content_type, bool(image_b64))
         return HttpResponseBadRequest("image required")
     try:
         client = OAuthClient.objects.get(client_id=client_id)
     except OAuthClient.DoesNotExist:
         return HttpResponseBadRequest("invalid client")
-    # Decode image and run checks
-    raw = base64.b64decode(image_b64.split(",")[-1])
-    image = Image.open(io.BytesIO(raw))
-    bgr = np.array(image)[:, :, ::-1]
+    # Validate redirect_uri against registered URIs
+    if redirect_uri not in (client.redirect_uris or []):
+        return HttpResponseBadRequest("invalid redirect_uri")
+    # Decode image(s) and run checks
+    def to_bgr(data_url):
+        raw = base64.b64decode(data_url.split(",")[-1])
+        image = Image.open(io.BytesIO(raw))
+        return np.array(image)[:, :, ::-1]
+
+    try:
+        bgr = to_bgr(image_b64)
+    except Exception:
+        return HttpResponseBadRequest("invalid image data")
+
     if not liveness.check(bgr):
         return HttpResponseBadRequest("liveness failed")
-    user = User.objects.first()
-    gallery = [
-        np.frombuffer(fe.vector, dtype=np.float32)
-        for fe in user.faceembedding_set.filter(active=True)
-    ]
-    probe = adapter.embed(bgr)
-    idx, score = adapter.match(probe, gallery)
-    if idx == -1 or score < 0.7:
+    # Build gallery over all active embeddings for current adapter.model_name and keep mapping to user
+    embeddings = []
+    owners = []
+    from accounts.models import FaceEmbedding as FE
+    from facekit.crypto import decrypt
+    for fe in FE.objects.filter(active=True, model_name=adapter.model_name).select_related("user"):
+        try:
+            plaintext = decrypt(bytes(fe.vector))
+            vec = np.frombuffer(plaintext, dtype=np.float32)
+            embeddings.append(vec)
+            owners.append(fe.user)
+        except Exception:
+            continue
+    # Detect/crop single frame if detector configured
+    detector = FaceDetector()
+    crop = detector.detect_and_crop(bgr)
+    if detector._fn is not None and crop is None:
+        return HttpResponseBadRequest("no face detected")
+    face_img = crop if crop is not None else bgr
+    probe = adapter.embed(face_img).astype(np.float32)
+    n = float(np.linalg.norm(probe))
+    if n > 0:
+        probe /= n
+    idx, score = adapter.match(probe, embeddings)
+    import os
+    try:
+        threshold = float(os.getenv("FACE_MATCH_THRESHOLD", "0.7"))
+    except ValueError:
+        threshold = 0.7
+    try:
+        margin = float(os.getenv("FACE_MATCH_MARGIN", "0.0"))
+    except ValueError:
+        margin = 0.0
+    # Optional margin: top-1 must exceed top-2 by margin; add debug logging
+    sims = [float(np.dot(probe, g) / (np.linalg.norm(probe) * np.linalg.norm(g))) for g in embeddings]
+    sims_sorted = sorted(sims, reverse=True) if sims else []
+    top1 = sims_sorted[0] if sims_sorted else 0.0
+    top2 = sims_sorted[1] if len(sims_sorted) > 1 else 0.0
+    if margin > 0 and len(embeddings) > 1:
+        if (top1 - top2) < margin:
+            if os.getenv("FACE_DEBUG", "").lower() == "true":
+                logging.info("authorize_verify reject (margin): top1=%.3f top2=%.3f thr=%.3f margin=%.3f", top1, top2, threshold, margin)
+            return HttpResponseBadRequest("face not recognized")
+    if idx == -1 or score < threshold:
+        if os.getenv("FACE_DEBUG", "").lower() == "true":
+            logging.info("authorize_verify reject (threshold): top1=%.3f top2=%.3f thr=%.3f margin=%.3f", top1, top2, threshold, margin)
         return HttpResponseBadRequest("face not recognized")
+    matched_user = owners[idx]
     session = AuthSession.objects.create(
         client=client,
-        user=user,
+        user=matched_user,
         state=state,
         nonce=data.get("nonce", ""),
         code_challenge=data.get("code_challenge", ""),
@@ -115,13 +177,19 @@ def authorize_verify(request):
         code=code,
         expires_at=timezone.now() + timezone.timedelta(minutes=10),
     )
-    return JsonResponse({"redirect": f"{redirect_uri}?code={code}&state={state}"})
+    if os.getenv("FACE_DEBUG", "").lower() == "true":
+        logging.info("authorize_verify accept: top1=%.3f top2=%.3f thr=%.3f margin=%.3f", top1, top2, threshold, margin)
+    return HttpResponseRedirect(f"{redirect_uri}?code={code}&state={state}")
 
 @csrf_exempt
 def token(request):
     if request.method != "POST":
         return HttpResponseBadRequest("POST required")
-    data = json.loads(request.body.decode())
+    # Accept JSON or form-encoded
+    if request.META.get("CONTENT_TYPE", "").startswith("application/json"):
+        data = json.loads(request.body.decode() or "{}")
+    else:
+        data = request.POST
     code = data.get("code")
     try:
         auth_code = AuthorizationCode.objects.get(code=code, consumed_at__isnull=True)
@@ -140,20 +208,46 @@ def token(request):
             computed = verifier
         if computed != challenge:
             return HttpResponseBadRequest("pkce verification failed")
+    # Enforce client authentication and PKCE as per client config
+    client = auth_code.session.client
+    # Client auth: from Basic header or body
+    client_id = None
+    client_secret = None
+    auth_header = request.META.get("HTTP_AUTHORIZATION", "")
+    if auth_header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth_header.split()[1]).decode()
+            client_id, client_secret = decoded.split(":", 1)
+        except Exception:
+            return HttpResponseBadRequest("invalid client auth header")
+    client_id = client_id or data.get("client_id")
+    client_secret = client_secret or data.get("client_secret")
+    if client.is_confidential:
+        import hashlib
+        if client_id != client.client_id or not client_secret:
+            return HttpResponseBadRequest("invalid client")
+        secret_hash = hashlib.sha256(client_secret.encode()).hexdigest()
+        if secret_hash != client.client_secret_hash:
+            return HttpResponseBadRequest("invalid client secret")
+    # PKCE enforcement per client flag
+    if client.pkce_enforced and not verifier:
+        return HttpResponseBadRequest("code_verifier required")
+
     auth_code.consumed_at = timezone.now()
     auth_code.save()
     user = auth_code.session.user or User.objects.first()
-    aud = auth_code.session.client.client_id
+    aud = client.client_id
     nonce = auth_code.session.nonce
     kid = "dev"
     jwks = json.loads(settings.PUBKEY_JWKS)
     if jwks.get("keys"):
         kid = jwks["keys"][0].get("kid", "dev")
+    import time as _time
     id_token = tokens.mint_id_token(
-        str(user.id), aud, nonce, int(auth_code.session.expires_at.timestamp()), kid
+        str(user.id), aud, nonce, int(_time.time()), kid
     )
     access_token = tokens.mint_access_token(
-        user, auth_code.session.client, auth_code.session.scope
+        user, client, auth_code.session.scope
     )
     refresh_token = tokens.mint_refresh_token(
         user, auth_code.session.client, auth_code.session.scope
@@ -183,6 +277,7 @@ def userinfo(request):
             "name": user.display_name,
             "email": user.email,
             "picture": user.avatar_url,
+            "email_verified": getattr(user, "email_verified", False),
         }
     )
 
@@ -225,3 +320,24 @@ def introspect(request):
             "sub": str(tok.user.id),
         }
     )
+
+
+def logout_view(request):
+    """Logs out local session and optionally redirects to a registered post-logout URI.
+
+    Accepts optional query params: client_id, post_logout_redirect_uri, state.
+    """
+    client_id = request.GET.get("client_id")
+    post_logout_redirect_uri = request.GET.get("post_logout_redirect_uri")
+    state = request.GET.get("state", "")
+    client = None
+    if client_id:
+        try:
+            client = OAuthClient.objects.get(client_id=client_id)
+        except OAuthClient.DoesNotExist:
+            client = None
+    dj_logout(request)
+    if client and post_logout_redirect_uri and post_logout_redirect_uri in (client.post_logout_redirect_uris or []):
+        uri = f"{post_logout_redirect_uri}?state={state}" if state else post_logout_redirect_uri
+        return HttpResponseRedirect(uri)
+    return JsonResponse({"logged_out": True})

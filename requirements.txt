@@ -1,0 +1,20 @@
+# Core backend dependencies
+Django
+djangorestframework
+Pillow
+numpy
+cryptography
+PyJWT
+# Load .env for Django settings
+python-dotenv
+# psycopg2-binary
+
+# Optional: sample scripts and experimentation (not required for server)
+# facenet-pytorch
+# torch
+# torchvision
+# opencv-python
+# pandas
+# matplotlib
+# tqdm
+# psycopg2-binary

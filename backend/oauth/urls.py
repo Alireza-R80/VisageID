@@ -11,4 +11,5 @@ urlpatterns = [
     path("userinfo", views.userinfo),
     path("revoke", views.revoke),
     path("introspect", views.introspect),
+    path("logout", views.logout_view),
 ]
