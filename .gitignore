@@ -1,4 +1,44 @@
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
 *.sqlite3
+db.sqlite3
+
+# Environments
 .env
+.env.*
+**/.env
+**/.env.*
+.venv/
+venv/
+env/
+ENV/
+
+# Django/Project
+backend/.keys/
+backend/db.sqlite3
+*.log
+
+# Node / Next.js
+node_modules/
+**/node_modules/
+.next/
+frontend/.next/
+frontend/.env.local
+**/.vercel/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Builds / Dist
+dist/
+build/
+coverage/
+.pytest_cache/
+**/.cache/
